@@ -13,9 +13,9 @@ Instructions (important: these instructions make you create your completely self
 1. `git clone https://github.com/hermesloom/algorand-node-fly`
 2. `cd algorand-node-fly`
 3. `./setup.sh 10000 EUR`
-   1. Answer `Would you like to copy its configuration to the new app?` with `y`
-   2. Answer `Do you want to tweak these settings before proceeding?` with `n`
-   3. Answer `Would you like to allocate dedicated ipv4 and ipv6 addresses now?` with `y`
+   - Answer `Would you like to copy its configuration to the new app?` with `y`
+   - Answer `Do you want to tweak these settings before proceeding?` with `n`
+   - Answer `Would you like to allocate dedicated ipv4 and ipv6 addresses now?` with `y`
 
 ## License
 
