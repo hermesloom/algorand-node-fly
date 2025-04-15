@@ -3,6 +3,7 @@
 import os
 import json
 import time
+import traceback
 from flask import Flask, request, jsonify, send_from_directory, redirect
 from algosdk import account, mnemonic, encoding
 from algosdk.v2client import algod
@@ -596,7 +597,8 @@ def transfer_funds():
             return jsonify({"tx_id": tx_id, "status": "pending", "error": str(e)}), 202
 
     except Exception as e:
-        app.logger.error(f"Error transferring funds: {e}")
+        stacktrace = traceback.format_exc()
+        app.logger.error(f"Error transferring funds: {e}\n{stacktrace}")
         return jsonify({"error": f"Failed to transfer funds: {str(e)}"}), 500
 
 
