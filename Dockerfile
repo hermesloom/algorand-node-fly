@@ -7,7 +7,7 @@ RUN apt-get update && \
 # Set up Python environment
 RUN python3 -m venv /algod/venv && \
     . /algod/venv/bin/activate && \
-    pip install flask gunicorn algosdk
+    pip install flask gunicorn algosdk flask-swagger-ui
 
 # Create required directories
 RUN mkdir -p /algod/data && \
