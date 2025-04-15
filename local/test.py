@@ -4,28 +4,27 @@ import unittest
 import json
 import os
 import time
+import requests
 import subprocess
 import re
 import socket
 import sys
-import urllib3
-import ssl
-from algosdk import account, mnemonic, encoding
-from algosdk.v2client import algod
-from algosdk.transaction import PaymentTxn
-from algosdk.error import AlgodHTTPError
-
-# Disable SSL warnings for testing
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from api_client import AlgorandAPIClient
 
 
-def determine_algod_host():
-    """Determine the Algorand node host using fly CLI and config."""
+def determine_api_host():
+    """Determine the API host using fly CLI and config."""
     # Get app name from fly.toml
-    app_name = get_app_name()
-    if not app_name:
-        print("No app name found in fly.toml, using localhost")
-        return "localhost"
+    try:
+        with open("fly.toml", "r") as f:
+            for line in f:
+                if line.startswith("app = "):
+                    app_name = line.split("=")[1].strip().strip("'\"")
+                    break
+    except:
+        app_name = "algorand-node"  # Default fallback
+
+    print(f"Using app name: {app_name}")
 
     # Get the IP address directly from Fly CLI
     print(f"Getting IP address for {app_name}...")
@@ -84,24 +83,26 @@ def determine_algod_host():
     return fly_host
 
 
-def load_genesis_info():
+def load_genesis_secrets():
     """Load genesis account information from generated file."""
-    genesis_info_file = "generated/genesis_info.json"
+    genesis_secrets_file = "generated/genesis_secrets.json"
 
-    if not os.path.exists(genesis_info_file):
-        print(f"ERROR: Genesis information file not found: {genesis_info_file}")
+    if not os.path.exists(genesis_secrets_file):
+        print(f"ERROR: Genesis information file not found: {genesis_secrets_file}")
         print("Please run setup.sh first to generate the genesis file.")
         sys.exit(1)
 
     try:
-        with open(genesis_info_file, "r") as f:
+        with open(genesis_secrets_file, "r") as f:
             genesis_data = json.load(f)
 
-        address = genesis_data.get("address")
-        mnemo = genesis_data.get("mnemonic")
+        # Get main genesis account info
+        genesis_info = genesis_data.get("genesis", {})
+        address = genesis_info.get("address")
+        mnemo = genesis_info.get("mnemonic")
 
         if not address or not mnemo:
-            print(f"ERROR: Missing address or mnemonic in {genesis_info_file}")
+            print(f"ERROR: Missing address or mnemonic in {genesis_secrets_file}")
             sys.exit(1)
 
         return address, mnemo
@@ -111,235 +112,204 @@ def load_genesis_info():
         sys.exit(1)
 
 
-def get_app_name():
-    """Extract the app name from fly.toml."""
-    if os.path.exists("fly.toml"):
-        try:
-            with open("fly.toml", "r") as f:
-                content = f.read()
-                app_match = re.search(r'app\s*=\s*[\'"]([^\'"]+)[\'"]', content)
-                if app_match:
-                    return app_match.group(1)
-        except Exception:
-            pass
-    return "algorand-node"  # Default fallback
-
-
-def load_api_token():
-    """Load the API token from the generated file."""
-    token_file = "generated/algod.token"
-
-    if not os.path.exists(token_file):
-        print(f"WARNING: API token file not found: {token_file}")
-        print("Using empty token. This might fail if API authentication is required.")
-        return ""
-
-    try:
-        with open(token_file, "r") as f:
-            token = f.read().strip()
-        return token
-    except Exception as e:
-        print(f"WARNING: Couldn't read API token: {e}")
-        return ""
-
-
-class AlgorandNodeTest(unittest.TestCase):
-    """Test suite for validating Algorand node deployment and basic functionality."""
-
-    # Test settings
-    MAX_RETRIES = 3
-    RETRY_DELAY = 2  # seconds
-
+class AlgorandAPITest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        """Set up test environment - connect to Algorand node."""
+        """Set up test environment - connect to the API and ensure it's healthy."""
         # Get required values from configuration files
-        cls.genesis_address, cls.genesis_mnemonic = load_genesis_info()
-        cls.algod_host = determine_algod_host()
-        cls.algod_token = load_api_token()
+        cls.genesis_address, cls.genesis_mnemonic = load_genesis_secrets()
 
-        # Derive keys from mnemonic
-        cls.genesis_private_key = mnemonic.to_private_key(cls.genesis_mnemonic)
-
-        # Create test account
-        cls.test_private_key, cls.test_address = account.generate_account()
-        cls.test_mnemonic = mnemonic.from_private_key(cls.test_private_key)
-        print(f"Test account created: {cls.test_address}")
+        cls.api_host = determine_api_host()
 
         # Test parameters
-        cls.test_transfer_amount = 1000000  # 1 Algo
+        cls.test_transfer_amount = 1000000  # 1 picoXDR = 1 microAlgo
 
-        # Determine if the host is an IP address
-        is_ip_address = cls.algod_host.replace(".", "").isdigit()
+        # Create API client
+        cls.api_client = AlgorandAPIClient(cls.api_host)
 
-        # Use HTTP for IP addresses (internal/testing) but HTTPS for domains (production)
-        if is_ip_address:
-            cls.algod_address = f"http://{cls.algod_host}"
-        else:
-            cls.algod_address = f"https://{cls.algod_host}"
-
-        # Create the client
-        cls.algod_client = algod.AlgodClient(cls.algod_token, cls.algod_address)
-
-        print(f"Using Algorand node at: {cls.algod_address}")
+        print(f"Using API at: {cls.api_client.api_url}")
         print(f"Using Genesis address: {cls.genesis_address}")
 
-        # Test connectivity with retries
-        cls.is_node_accessible = cls.check_connectivity()
-        if not cls.is_node_accessible:
-            print(
-                f"\n⚠️  WARNING: Could not connect to Algorand node at {cls.algod_address}"
-            )
-            print("Tests will likely fail. The node may not be ready or deployed yet.")
+        # Wait for API to be healthy before running tests
+        cls.wait_for_api_health()
 
     @classmethod
-    def check_connectivity(cls):
-        """Check if we can connect to the Algorand node with retries."""
-        for attempt in range(cls.MAX_RETRIES):
+    def wait_for_api_health(cls):
+        """Wait for the API to become healthy with retries."""
+        MAX_RETRY_ATTEMPTS = 15  # More retries for initial setup
+        RETRY_DELAY = 5  # seconds
+
+        print(f"Waiting for API to be healthy (max {MAX_RETRY_ATTEMPTS} attempts)...")
+
+        for attempt in range(MAX_RETRY_ATTEMPTS):
             try:
-                status = cls.algod_client.status()
-                return True
-            except Exception as e:
-                if attempt < cls.MAX_RETRIES - 1:
+                if cls.api_client.health_check():
                     print(
-                        f"Connection attempt {attempt+1}/{cls.MAX_RETRIES} failed: {e}"
+                        f"✅ API is healthy! (attempt {attempt+1}/{MAX_RETRY_ATTEMPTS})"
                     )
-                    print(f"Retrying in {cls.RETRY_DELAY} seconds...")
-                    time.sleep(cls.RETRY_DELAY)
+                    return
                 else:
-                    print(f"Final connection attempt failed: {e}")
-        return False
+                    print(
+                        f"❌ API unhealthy on attempt {attempt+1}/{MAX_RETRY_ATTEMPTS}"
+                    )
+            except Exception as e:
+                print(
+                    f"❌ Connection error on attempt {attempt+1}/{MAX_RETRY_ATTEMPTS}: {e}"
+                )
 
-    def setUp(self):
-        """Set up for each test - skip if node isn't accessible."""
-        if not self.is_node_accessible:
-            self.skipTest("Skipping test due to node connectivity issues")
+            # Last attempt - don't sleep
+            if attempt < MAX_RETRY_ATTEMPTS - 1:
+                print(f"Waiting {RETRY_DELAY} seconds before next health check...")
+                time.sleep(RETRY_DELAY)
 
-    def test_01_node_connection(self):
-        """Test connectivity to the Algorand node."""
+        # If we get here, we couldn't connect after all retries
+        print("\n⚠️  WARNING: Could not verify API health after multiple attempts")
+        print("Tests will proceed anyway, but may fail if the API is not ready.")
+        print("\nTROUBLESHOOTING STEPS:")
+        print("1. Check if the Fly.io app is running with 'fly status'")
+        print("2. Check server logs with 'fly logs'")
+        print("3. Make sure the server is properly configured")
+
+    def create_test_account(self):
+        """Helper to create a test account for any test that needs one."""
+        # Create a new account
+        account_info = self.api_client.create_account()
+
+        # Validate the response
+        self.assertIn("address", account_info)
+        self.assertIn("mnemonic", account_info)
+        self.assertTrue(len(account_info["address"]) > 30)
+        self.assertTrue(len(account_info["mnemonic"].split()) == 25)
+
+        return account_info
+
+    def test_01_health_check(self):
+        """Test the health check endpoint."""
+        healthy = self.api_client.health_check()
+        self.assertTrue(healthy, "API health check failed")
+
+    def test_02_create_account(self):
+        """Test account creation."""
         try:
-            node_status = self.algod_client.status()
-            self.assertIsNotNone(node_status)
-            print(f"Connected to Algorand node: {node_status}")
+            # Create a test account and verify it
+            account_info = self.create_test_account()
+            self.assertIsNotNone(account_info, "Should create a valid account")
         except Exception as e:
-            self.fail(f"Failed to connect to Algorand node: {e}")
+            self.fail(f"Failed to create account: {e}")
 
-    def test_02_node_syncing(self):
-        """Test if the node is syncing."""
-        try:
-            node_status = self.algod_client.status()
-            self.assertIn("last-round", node_status)
-            print(f"Node last round: {node_status['last-round']}")
-        except Exception as e:
-            self.fail(f"Failed to check node sync status: {e}")
-
-    def test_03_genesis_account_balance(self):
+    def test_03_check_genesis_balance(self):
         """Test if genesis account has funds."""
         try:
-            account_info = self.algod_client.account_info(self.genesis_address)
-            self.assertIn("amount", account_info)
-            balance = account_info["amount"]
+            account_info = self.api_client.get_balance(
+                self.genesis_address, self.genesis_mnemonic
+            )
+
+            self.assertIn("balance", account_info)
+            balance = account_info["balance"]
             self.assertGreater(balance, 0, "Genesis account has no funds")
-            print(f"Genesis account balance: {balance} microAlgos")
+
+            print(f"Genesis account balance: {balance} picoXDRs")
         except Exception as e:
             self.fail(f"Failed to check genesis account balance: {e}")
 
-    def test_04_create_transaction(self):
-        """Test transaction creation."""
+    def test_04_transfer_funds(self):
+        """Test transferring funds from genesis to a new test account."""
         try:
-            # Get parameters for transaction
-            params = self.algod_client.suggested_params()
+            # Create a test account to transfer funds to
+            test_account = self.create_test_account()
 
-            # Create a transaction
-            unsigned_txn = PaymentTxn(
-                sender=self.genesis_address,
-                sp=params,
-                receiver=self.test_address,
-                amt=self.test_transfer_amount,
-                note="Test transaction".encode(),
+            # Transfer funds from genesis to test account
+            result = self.api_client.transfer(
+                self.genesis_address,
+                self.genesis_mnemonic,
+                test_account["address"],
+                self.test_transfer_amount,
+                "Test transfer",
             )
 
-            # Check transaction was created
-            self.assertIsNotNone(unsigned_txn)
-            print("Successfully created test transaction")
-        except Exception as e:
-            self.fail(f"Failed to create transaction: {e}")
+            # Check result
+            self.assertIn("tx_id", result)
+            self.assertIn("status", result)
+            tx_id = result["tx_id"]
 
-    def test_05_sign_and_send_transaction(self):
-        """Test transaction signing and submission."""
-        try:
-            # Get parameters for transaction
-            params = self.algod_client.suggested_params()
+            print(f"Transfer initiated with transaction ID: {tx_id}")
 
-            # Create a transaction
-            unsigned_txn = PaymentTxn(
-                sender=self.genesis_address,
-                sp=params,
-                receiver=self.test_address,
-                amt=self.test_transfer_amount,
-                note="Test transaction".encode(),
+            # If status is pending, wait briefly for confirmation
+            if result["status"] == "pending":
+                print("Transaction pending, waiting 5 seconds for confirmation...")
+                time.sleep(5)
+
+            # Verify the balance was received by checking the test account
+            account_info = self.api_client.get_balance(
+                test_account["address"], test_account["mnemonic"]
             )
 
-            # Sign the transaction
-            signed_txn = unsigned_txn.sign(self.genesis_private_key)
+            self.assertIn("balance", account_info)
+            balance = account_info["balance"]
 
-            # Send the transaction
-            try:
-                tx_id = self.algod_client.send_transaction(signed_txn)
-                print(f"Transaction sent with ID: {tx_id}")
-
-                # Wait for confirmation
-                self.wait_for_confirmation(tx_id)
-                print("Transaction confirmed")
-            except AlgodHTTPError as e:
-                # If this is a private network starting up, it might not accept transactions yet
-                # We'll consider this a "soft failure" and print a warning
-                print(f"Warning: Couldn't send transaction: {e}")
-                print("This might be expected if the network is still starting up.")
-                return
-        except Exception as e:
-            self.fail(f"Failed to sign or send transaction: {e}")
-
-    def test_06_verify_receipt(self):
-        """Test if the test account received the funds."""
-        try:
-            # Check if the previous transaction test was successful
-            if not hasattr(self, "transaction_successful"):
-                print("Skipping verification as transaction test was not successful")
-                return
-
-            # Check receiver's balance
-            account_info = self.algod_client.account_info(self.test_address)
-            self.assertIn("amount", account_info)
-            balance = account_info["amount"]
+            # The test account should have the transferred amount (or potentially more)
             self.assertGreaterEqual(
                 balance,
                 self.test_transfer_amount,
                 f"Test account balance {balance} is less than transfer amount {self.test_transfer_amount}",
             )
-            print(f"Test account balance: {balance} microAlgos")
+
+            print(f"Test account received {balance} picoXDRs")
+
         except Exception as e:
-            self.fail(f"Failed to verify transaction receipt: {e}")
+            self.fail(f"Failed to transfer funds and verify: {e}")
 
-    def wait_for_confirmation(self, txid):
-        """Wait until the transaction is confirmed or rejected."""
-        last_round = self.algod_client.status().get("last-round", 0)
-        while True:
-            try:
-                pending_txn = self.algod_client.pending_transaction_info(txid)
-            except Exception:
-                return
-            if pending_txn.get("confirmed-round", 0) > 0:
-                # Transaction confirmed
-                self.transaction_successful = True
-                return
-            elif pending_txn.get("pool-error", None):
-                # Transaction rejected
-                raise Exception(f'Transaction rejected: {pending_txn["pool-error"]}')
+    def test_05_multiple_accounts(self):
+        """Test creating multiple accounts and transferring between them."""
+        try:
+            # Create two test accounts
+            account1 = self.create_test_account()
+            account2 = self.create_test_account()
 
-            last_round += 1
-            self.algod_client.status_after_block(last_round)
-            time.sleep(2)  # Brief pause to avoid hammering the API
+            # Fund account1 from genesis
+            fund_result = self.api_client.transfer(
+                self.genesis_address,
+                self.genesis_mnemonic,
+                account1["address"],
+                self.test_transfer_amount * 2,  # Double for transfer between accounts
+                "Fund for multi-account test",
+            )
+
+            # Wait for confirmation
+            if fund_result["status"] == "pending":
+                print("Funding transaction pending, waiting for confirmation...")
+                time.sleep(5)
+
+            # Transfer from account1 to account2
+            transfer_amount = self.test_transfer_amount
+            transfer_result = self.api_client.transfer(
+                account1["address"],
+                account1["mnemonic"],
+                account2["address"],
+                transfer_amount,
+                "Transfer between test accounts",
+            )
+
+            # Wait for confirmation
+            if transfer_result["status"] == "pending":
+                print("Transfer transaction pending, waiting for confirmation...")
+                time.sleep(5)
+
+            # Verify account2 received the funds
+            account2_info = self.api_client.get_balance(
+                account2["address"], account2["mnemonic"]
+            )
+
+            self.assertGreaterEqual(
+                account2_info["balance"],
+                transfer_amount,
+                "Account2 should have received the transferred funds",
+            )
+
+            print(f"Account2 received {account2_info['balance']} picoXDRs")
+
+        except Exception as e:
+            self.fail(f"Failed in multiple account test: {e}")
 
 
 if __name__ == "__main__":

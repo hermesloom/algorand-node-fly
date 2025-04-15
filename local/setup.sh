@@ -13,16 +13,9 @@ python3 -m venv venv
 source venv/bin/activate
 pip install algosdk requests
 
-# Create the generated directory
-mkdir -p generated
+python3 local/create-genesis-json.py "$1" "$2"
 
-# Generate the genesis file with example SDR value
-python3 local/create-genesis-json.py 100 USD
-
-# Generate API token
-python3 local/create-api-key.py
-
-echo "Setup complete! Genesis file and API token created in the 'generated' directory."
+echo "Setup complete! Genesis file created in the 'generated' directory."
 
 fly launch
 

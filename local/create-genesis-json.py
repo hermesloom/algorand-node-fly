@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import json
 import os
 import sys
@@ -8,6 +10,7 @@ from io import StringIO
 import csv
 from decimal import Decimal, getcontext
 from algosdk import account, mnemonic
+import datetime
 
 # Set decimal precision
 getcontext().prec = 28
@@ -129,71 +132,83 @@ def convert_to_sdrs(amount, currency_code, exchange_rates):
     return sdrs
 
 
-def main():
-    # Set up argument parser
-    parser = argparse.ArgumentParser(
-        description="Create a genesis.json file with a specified currency amount."
-    )
-    parser.add_argument(
-        "amount", type=float, help="The amount in the specified currency"
-    )
-    parser.add_argument("currency", type=str, help="Three-letter ISO currency code")
+def create_genesis_json(amount_xdr, currency):
+    """Create a genesis.json file for a new Algorand network with dedicated accounts."""
 
-    args = parser.parse_args()
-    amount = args.amount
-    currency_code = args.currency.upper()
+    # Generate accounts
+    genesis_private_key, genesis_address = account.generate_account()
+    genesis_mnemo = mnemonic.from_private_key(genesis_private_key)
 
-    # Download and parse IMF data
-    exchange_rates = download_and_parse_imf_data()
+    rewards_private_key, rewards_address = account.generate_account()
+    rewards_mnemo = mnemonic.from_private_key(rewards_private_key)
 
-    # Convert amount to SDRs
-    sdrs = convert_to_sdrs(amount, currency_code, exchange_rates)
+    fee_sink_private_key, fee_sink_address = account.generate_account()
+    fee_sink_mnemo = mnemonic.from_private_key(fee_sink_private_key)
 
-    # Calculate microalgos (SDRs * 1,000,000,000,000) as an integer
-    # Use Decimal arithmetic for precision
-    microalgos = int(sdrs * Decimal("1000000000000"))
-
-    # Generate Algorand account
-    private_key, address = account.generate_account()
-    mnemo = mnemonic.from_private_key(private_key)
-    print("Genesis address:", address)
-    print("Genesis mnemonic:", mnemo)
-
-    # Show conversion information
-    print(f"Converting {amount} {currency_code} to {sdrs:.6f} SDRs")
-    print(f"Setting initial balance to {microalgos} microAlgos")
-
-    # Genesis file template
-    genesis_template = {
-        "alloc": [
-            {
-                "addr": address,  # Use the generated address
-                "state": {"algo": microalgos, "onl": 0},
-            }
-        ],
-        "network": "solarfunk",
-        "proto": "future",
-        "rwd": address,
-        "fees": address,
-        "timestamp": int(time.time()),  # Use current timestamp
+    # Store accounts in genesis_secrets.json
+    genesis_info = {
+        "genesis": {"address": genesis_address, "mnemonic": genesis_mnemo},
+        "rewards": {"address": rewards_address, "mnemonic": rewards_mnemo},
+        "fee_sink": {"address": fee_sink_address, "mnemonic": fee_sink_mnemo},
     }
 
-    # Create the generated directory if it doesn't exist
-    generated_dir = "generated"
-    os.makedirs(generated_dir, exist_ok=True)
+    # Convert XDR amount to picoXDRs (1 XDR = 1,000,000,000,000 picoXDRs)
+    amount_picoxdr = int(float(amount_xdr) * 1_000_000_000_000)
+    print(
+        f"Initializing genesis account with {amount_xdr} XDR = {amount_picoxdr} picoXDRs"
+    )
 
-    # Write the genesis file
+    # Create genesis file structure with an integer timestamp
+    genesis_time = int(time.time())
+
+    genesis_json = {
+        "alloc": [
+            {
+                "addr": genesis_address,
+                "state": {
+                    "algo": amount_picoxdr,
+                    "onl": 1,
+                },
+            }
+        ],
+        "fees": fee_sink_address,
+        "network": "solarfunk",
+        "proto": "future",
+        "rwd": rewards_address,
+        "timestamp": genesis_time,
+    }
+
+    # Ensure output directory exists
+    os.makedirs("generated", exist_ok=True)
+
+    # Write genesis.json
     with open("generated/genesis.json", "w") as f:
-        json.dump(genesis_template, f, indent=2)
+        json.dump(genesis_json, f, indent=2)
 
-    # Store genesis account info in a separate file
-    genesis_info = {"address": address, "mnemonic": mnemo}
-
-    with open("generated/genesis_info.json", "w") as f:
+    # Write genesis_secrets.json with all account details
+    with open("generated/genesis_secrets.json", "w") as f:
         json.dump(genesis_info, f, indent=2)
 
-    print(f"Genesis file created with account {address} in generated/genesis.json")
-    print(f"Genesis account information stored in generated/genesis_info.json")
+    print(f"Genesis files created:")
+    print(f"  - generated/genesis.json")
+    print(f"  - generated/genesis_secrets.json")
+    print(f"\nGenesis account: {genesis_address}")
+    print(f"Rewards account: {rewards_address}")
+    print(f"Fee sink account: {fee_sink_address}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Create a genesis.json file for a new Algorand network"
+    )
+    parser.add_argument(
+        "amount", help="Amount of XDR to initialize in the genesis account"
+    )
+    parser.add_argument("currency", help="Currency code for reference (e.g., EUR, USD)")
+
+    args = parser.parse_args()
+
+    create_genesis_json(args.amount, args.currency)
 
 
 if __name__ == "__main__":

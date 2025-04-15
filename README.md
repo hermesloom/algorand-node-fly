@@ -8,7 +8,7 @@ Prerequisites:
 - `python3`
 - `fly`
 
-Instructions:
+Instructions (important: these instructions make you create your completely self-hosted network, unrelated to the Algorand main network):
 
 1. `git clone https://github.com/hermesloom/algorand-node-fly`
 2. `cd algorand-node-fly`

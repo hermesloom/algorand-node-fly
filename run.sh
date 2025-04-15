@@ -1,5 +1,4 @@
 #!/bin/bash
-# Strict error handling
 set -euo pipefail
 
 # Log with timestamp
@@ -13,7 +12,10 @@ error_exit() {
   exit 1
 }
 
-log "Starting Algorand node initialization..."
+log "Starting Algorand node and API server setup..."
+
+# Activate Python virtual environment
+source /algod/venv/bin/activate
 
 # Create the data directory with secure permissions
 mkdir -p /algod/data
@@ -34,20 +36,15 @@ CONFIG_FILE="/algod/data/config.json"
 if [ ! -f "$CONFIG_FILE" ]; then
   log "Creating config.json with correct network settings..."
   
-  # Check if we have a token file
-  if [ -f "/algod/data/algod.token" ]; then
-    log "Using provided API token for authentication"
-  else
-    # If no token file found, create one with the same content as in admin.token
-    log "No API token file found, creating one..."
-    echo "$(cat /algod/data/admin.token)" > /algod/data/algod.token
-    chmod 600 /algod/data/algod.token
-  fi
+  # Always generate a new algod token
+  log "Generating new Algorand API token..."
+  echo "$(cat /algod/data/admin.token 2>/dev/null || openssl rand -hex 32)" > /algod/data/algod.token
+  chmod 600 /algod/data/algod.token
 
   cat > "$CONFIG_FILE" << EOF
 {
   "Version": 12,
-  "EndpointAddress": "0.0.0.0:8080",
+  "EndpointAddress": "127.0.0.1:8080",
   "DNSBootstrapID": "",
   "EnableDeveloperAPI": true,
   "EnableProfiler": false,
@@ -58,40 +55,43 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "CatchpointInterval": 1000,
   "CatchpointFileHistoryLength": 365,
   "NetAddress": "0.0.0.0:4160",
-  "APIEndpoint": "0.0.0.0:8080",
+  "APIEndpoint": "127.0.0.1:8080",
   "UseRelayAddrFromForwardedForHeader": true,
   "AdminAPIToken": "",
   "DisableTelemetry": true,
-  "EnableAPIAuth": true
+  "EnableAPIAuth": true,
+  "BlockGeneration": true
 }
 EOF
   chmod 600 "$CONFIG_FILE"
 fi
 
-# Initialize the node if not already initialized
-if [ ! -d /algod/data/ledger ]; then
-  log "Initializing Algorand node..."
-  
-  # Initialize from the genesis file
-  # The fee sink is already included in the genesis file
-  algod -d /algod/data -g /algod/data/genesis.json || error_exit "Failed to initialize Algorand node"
-fi
+# Copy the server API script
+log "Setting up the secure API server..."
+cp /app/server_api.py /algod/server_api.py
+chmod 700 /algod/server_api.py
 
-# Log environment information for debugging
-log "Network configuration:"
-echo "---------------------"
-ip addr show
-echo "---------------------"
-netstat -tulpn 2>/dev/null | grep LISTEN || echo "netstat command not available"
-echo "---------------------"
-
-# Check if algod is already running and kill it if needed
-if pgrep -x "algod" > /dev/null; then
-  log "Algorand node is already running. Stopping it..."
-  pkill -x "algod" || error_exit "Failed to stop existing Algorand node"
-  sleep 2
-fi
-
-# Start the node with proper parameters
+# Start the Algorand node in the background
 log "Starting Algorand node..."
-exec algod -d /algod/data
+algod -d /algod/data &
+ALGOD_PID=$!
+
+# Wait for the node to be ready
+log "Waiting for Algorand node to start..."
+sleep 5
+
+# Start the API server in the background
+log "Starting secure API server..."
+gunicorn --bind 0.0.0.0:3000 --workers 4 --access-logfile - --error-logfile - "server_api:app" &
+GUNICORN_PID=$!
+
+# Wait for either process to exit
+log "Both processes started. Waiting for one to exit..."
+wait -n
+
+# If either process exits, kill the other and exit
+log "One process exited. Shutting down both..."
+kill $ALGOD_PID $GUNICORN_PID 2>/dev/null || true
+wait
+
+log "Shutdown complete."
